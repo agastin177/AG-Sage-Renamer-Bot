@@ -1,2 +1,3 @@
 kurigram
 tgcrypto
+pillow
