@@ -31,6 +31,11 @@ THUMB_PATH = DATA_DIR / "custom_thumbnail.jpg"
 # One pending file per user/chat.
 pending = {}
 
+# Pyrogram/Kurigram binds to the event loop at Client creation, so create
+# one loop first and run everything on that same loop (fixes "different loop").
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 app = Client(
     "ag_sage_renamer_bot",
     api_id=API_ID,
@@ -334,4 +339,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
