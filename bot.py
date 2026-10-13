@@ -1,10 +1,12 @@
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import shutil
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -24,6 +26,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Set API_ID, API_HASH and BOT_TOKEN in Render Environment.")
 
+MAX_TRANSMISSIONS = int(os.getenv("MAX_TRANSMISSIONS", "8"))
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/ag_sage_renamer"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 WORK_DIR = DATA_DIR / "work"
@@ -33,19 +37,40 @@ THUMB_PATH = DATA_DIR / "custom_thumbnail.jpg"
 # One pending file per user/chat.
 pending = {}
 
+CANCEL_MARKUP = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("✖️ CANCEL ✖️", callback_data="cancel")]]
+)
+
 # Pyrogram/Kurigram binds to the event loop at Client creation, so create
 # one loop first and run everything on that same loop (fixes "different loop").
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-app = Client(
-    "ag_sage_renamer_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workers=8,
-    sleep_threshold=30,
-)
+
+def build_client():
+    kwargs = dict(
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        workers=16,
+        sleep_threshold=30,
+    )
+    try:
+        return Client(
+            "ag_sage_renamer_bot",
+            max_concurrent_transmissions=MAX_TRANSMISSIONS,
+            **kwargs,
+        )
+    except TypeError:
+        log.warning("max_concurrent_transmissions not supported; using defaults")
+        return Client("ag_sage_renamer_bot", **kwargs)
+
+
+app = build_client()
+
+
+class TransferCancelled(Exception):
+    pass
 
 
 def original_filename(message):
@@ -93,25 +118,137 @@ def human_size(size):
         value /= 1024
 
 
-def make_progress(client, chat_id, msg_id, label):
-    # Live progress on the status message (throttled to avoid FloodWait).
-    state = {"t": 0.0}
+def fmt_size(size, decimals=2):
+    value = float(size or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.{decimals}f} {unit}"
+        value /= 1024
 
-    async def callback(current, total):
-        now = time.time()
-        if now - state["t"] < 5 and current != total:
-            return
-        state["t"] = now
-        pct = (current * 100 / total) if total else 0
-        try:
-            await client.edit_message_text(
-                chat_id, msg_id,
-                f"{label}\n{human_size(current)} / {human_size(total)} ({pct:.0f}%)",
-            )
-        except Exception:
-            pass
 
-    return callback
+def fmt_eta(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}h {minutes}m {secs}s"
+
+
+def fmt_elapsed(seconds):
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    return f"{minutes}m {secs}s"
+
+
+class Transfer:
+    """Live download/upload progress.
+
+    The transfer callback only stores numbers (fast, never blocks the transfer).
+    A separate background task edits the Telegram message every few seconds.
+    Speed is measured over a sliding window, ETA = remaining / speed, and the
+    elapsed time comes from a monotonic clock, so all values stay accurate.
+    """
+
+    WINDOW = 8.0  # seconds used for the speed average
+    EDIT_EVERY = 3.0  # seconds between message edits
+
+    def __init__(self, client, message, job):
+        self.client = client
+        self.chat_id = message.chat.id
+        self.msg_id = message.id
+        self.job = job
+        self.icon = "📥"
+        self.verb = "Downloading"
+        self.task = None
+        self.last_text = None
+        self._reset()
+
+    def _reset(self):
+        self.start = time.monotonic()
+        self.current = 0
+        self.total = 0
+        self.samples = deque([(self.start, 0)])
+        self.last_sample = self.start
+
+    async def callback(self, current, total):
+        if self.job.get("cancel"):
+            self.client.stop_transmission()
+        now = time.monotonic()
+        self.current = current
+        self.total = total
+        if now - self.last_sample >= 0.5 or (total and current >= total):
+            self.samples.append((now, current))
+            self.last_sample = now
+
+    def _speed(self, now):
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.WINDOW:
+            self.samples.popleft()
+        t0, c0 = self.samples[0]
+        c1 = self.samples[-1][1]
+        dt = now - t0
+        if dt <= 0 or c1 < c0:
+            return 0.0
+        return (c1 - c0) / dt
+
+    def text(self):
+        now = time.monotonic()
+        total = self.total
+        current = min(self.current, total) if total else self.current
+        percent = (current * 100 / total) if total else 0.0
+        filled = min(10, int(percent // 10))
+        bar = "■" * filled + "□" * (10 - filled)
+        speed = self._speed(now)
+        if total and current >= total:
+            eta = "0h 0m 0s"
+        elif speed > 0 and total:
+            eta = fmt_eta((total - current) / speed)
+        else:
+            eta = "Calculating..."
+        return (
+            f"Progress: [{bar}] {percent:.1f}%\n"
+            f"{self.icon} {self.verb}: {fmt_size(current)} | {fmt_size(total)}\n"
+            f"⚡ Speed: {fmt_size(speed, 1)}/s\n"
+            f"⏳ ETA: {eta}\n"
+            f"⏱️ Time elapsed: {fmt_elapsed(now - self.start)}"
+        )
+
+    async def _updater(self):
+        await asyncio.sleep(1)
+        while True:
+            text = self.text()
+            if text != self.last_text:
+                try:
+                    await self.client.edit_message_text(
+                        self.chat_id, self.msg_id, text, reply_markup=CANCEL_MARKUP
+                    )
+                    self.last_text = text
+                except Exception:
+                    log.debug("Progress edit failed", exc_info=True)
+            await asyncio.sleep(self.EDIT_EVERY)
+
+    async def begin(self, icon, verb):
+        await self.stop()
+        self.icon = icon
+        self.verb = verb
+        self.last_text = None
+        self._reset()
+        self.task = asyncio.create_task(self._updater())
+
+    def restart(self):
+        # Used when an upload is retried (e.g. video -> document).
+        self.last_text = None
+        self._reset()
+
+    async def stop(self):
+        if self.task:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
+            self.task = None
 
 
 async def delete_message(chat_id, message_id):
@@ -123,13 +260,20 @@ async def delete_message(chat_id, message_id):
         log.debug("Unable to delete message %s", message_id, exc_info=True)
 
 
+async def safe_edit(chat_id, message_id, text):
+    try:
+        await app.edit_message_text(chat_id, message_id, text)
+    except Exception:
+        log.debug("Edit failed", exc_info=True)
+
+
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client, message):
     await client.send_message(
         message.chat.id,
-        "Hi! File anuppunga, naan rename pannuren.\n"
-        "Custom thumbnail set panna first oru image anuppunga.\n"
-        "Vera image anuppina, old thumbnail replace aagum.",
+        "Hi! Send me a file and I will rename it.\n"
+        "To set a custom thumbnail, send an image first.\n"
+        "Sending another image replaces the old thumbnail.",
         reply_to_message_id=message.id,
     )
 
@@ -140,7 +284,7 @@ async def save_thumbnail_handler(client, message):
     downloaded = None
     try:
         status = await client.send_message(
-            message.chat.id, "Image save pannuren... ⏳",
+            message.chat.id, "Saving image... ⏳",
             reply_to_message_id=message.id,
         )
         downloaded = await client.download_media(
@@ -150,24 +294,19 @@ async def save_thumbnail_handler(client, message):
             raise RuntimeError("Image download failed.")
         make_thumbnail(downloaded)
         await client.edit_message_text(
-            message.chat.id,
-            status.id,
-            "✅ Image Saved Successful\n"
-            "Intha image files-oda thumbnail-ah use aagum. "
-            "Vera image anuppina old image replace aagidum.",
+            message.chat.id, status.id, "✅ Image Saved Successful"
         )
     except Exception as exc:
         log.exception("Could not save thumbnail")
         if status:
-            try:
-                await client.edit_message_text(
-                    message.chat.id, status.id,
-                    f"❌ Image save aagala: {str(exc)[:250]}",
-                )
-            except Exception:
-                pass
+            await safe_edit(
+                message.chat.id, status.id,
+                f"❌ Failed to save image: {str(exc)[:250]}",
+            )
         else:
-            await client.send_message(message.chat.id, "❌ Image save aagala. Marubadi try pannunga.")
+            await client.send_message(
+                message.chat.id, "❌ Failed to save image. Please try again."
+            )
     finally:
         if downloaded:
             try:
@@ -196,10 +335,13 @@ async def receive_file_handler(client, message):
     )
     pending[key] = {
         "source_message_id": message.id,
+        "keyword_id": None,
         "original_name": name,
         "prompt_id": prompt.id,
         "choice_id": None,
         "new_name": None,
+        "running": False,
+        "cancel": False,
     }
 
 
@@ -212,6 +354,7 @@ async def receive_filename_handler(client, message):
         return
 
     job["new_name"] = safe_filename(message.text, job["original_name"])
+    job["keyword_id"] = message.id
     # Remove the bot's filename prompt as soon as the user enters a name.
     await delete_message(message.chat.id, job.get("prompt_id"))
     job["prompt_id"] = None
@@ -220,14 +363,29 @@ async def receive_filename_handler(client, message):
         [InlineKeyboardButton("📁 Document", callback_data="output:document")],
         [InlineKeyboardButton("🎥 Video", callback_data="output:video")],
     ])
+    # Reply directly to the user's filename (keyword) message.
     choice = await client.send_message(
         message.chat.id,
         "Select The Output File Type\n\n"
         f"File Name :- {job['new_name']}",
-        reply_to_message_id=job["source_message_id"],
+        reply_to_message_id=message.id,
         reply_markup=buttons,
     )
     job["choice_id"] = choice.id
+
+
+@app.on_callback_query(filters.regex(r"^cancel$"))
+async def cancel_transfer(client, query):
+    if not query.message:
+        await query.answer("Message not found.", show_alert=True)
+        return
+    key = (query.message.chat.id, query.from_user.id)
+    job = pending.get(key)
+    if not job or not job.get("running"):
+        await query.answer("Nothing to cancel.", show_alert=True)
+        return
+    job["cancel"] = True
+    await query.answer("Cancelling...")
 
 
 @app.on_callback_query(filters.regex(r"^output:(document|video)$"))
@@ -241,28 +399,47 @@ async def send_renamed_file(client, query):
     key = (chat_id, query.from_user.id)
     job = pending.get(key)
     if not job or not job.get("new_name"):
-        await query.answer("Session expired. File-a marubadi anuppunga.", show_alert=True)
+        await query.answer("Session expired. Please send the file again.", show_alert=True)
+        return
+    if job.get("running"):
+        await query.answer("Already processing.", show_alert=True)
         return
 
+    job["running"] = True
     kind = query.data.split(":", 1)[1]
     await query.answer("Processing...")
-    progress = await client.send_message(
-        chat_id, "⏳ File download/upload nadakkuthu. Please wait...",
-        reply_to_message_id=job["source_message_id"],
-    )
+
+    # Output type selection message is removed as soon as a button is pressed.
+    await delete_message(chat_id, msg.id)
+    job["choice_id"] = None
+
+    reply_to = job.get("keyword_id") or job["source_message_id"]
     downloaded = None
     output = None
+    progress = None
+    transfer = None
 
     try:
+        progress = await client.send_message(
+            chat_id, "Starting download... ⏳",
+            reply_to_message_id=reply_to,
+            reply_markup=CANCEL_MARKUP,
+        )
+        transfer = Transfer(client, progress, job)
+
         source = await client.get_messages(chat_id, job["source_message_id"])
         if not source or not (source.document or source.video or source.audio or source.animation):
-            raise RuntimeError("Original file kidaikkala. File-a marubadi anuppunga.")
+            raise RuntimeError("Original file not found. Please send the file again.")
 
+        await transfer.begin("📥", "Downloading")
         downloaded = await client.download_media(
             source,
             file_name=str(WORK_DIR / f"download_{source.id}"),
-            progress=make_progress(client, chat_id, progress.id, "⬇️ Download aagudhu..."),
+            progress=transfer.callback,
         )
+        await transfer.stop()
+        if job.get("cancel"):
+            raise TransferCancelled()
         if not downloaded or not Path(downloaded).is_file():
             raise RuntimeError("Download failed.")
 
@@ -274,48 +451,60 @@ async def send_renamed_file(client, query):
         thumbnail = str(THUMB_PATH) if THUMB_PATH.is_file() else None
         common = {
             "chat_id": chat_id,
-            "reply_to_message_id": job["source_message_id"],
+            "reply_to_message_id": reply_to,
             "caption": Path(output).name,
         }
 
-        up_progress = make_progress(client, chat_id, progress.id, "⬆️ Upload aagudhu...")
-
+        await transfer.begin("📤", "Uploading")
+        sent = None
         if kind == "video":
             try:
-                await client.send_video(
+                sent = await client.send_video(
                     video=output,
                     thumb=thumbnail,
                     supports_streaming=True,
-                    progress=up_progress,
+                    progress=transfer.callback,
                     **common,
                 )
             except Exception as video_error:
+                if job.get("cancel"):
+                    raise TransferCancelled()
                 # MKV and some containers may not be accepted as Telegram videos.
                 log.warning("Video upload failed; retrying as document: %s", video_error)
-                await client.send_document(
-                    document=output, thumb=thumbnail, progress=up_progress, **common
+                transfer.restart()
+                sent = await client.send_document(
+                    document=output, thumb=thumbnail,
+                    progress=transfer.callback, **common
                 )
         else:
-            await client.send_document(
-                document=output, thumb=thumbnail, progress=up_progress, **common
+            sent = await client.send_document(
+                document=output, thumb=thumbnail,
+                progress=transfer.callback, **common
             )
+        await transfer.stop()
+        if sent is None:
+            if job.get("cancel"):
+                raise TransferCancelled()
+            raise RuntimeError("Upload failed.")
 
         await delete_message(chat_id, progress.id)
-        await delete_message(chat_id, job.get("choice_id"))
-        pending.pop(key, None)
 
+    except TransferCancelled:
+        if progress:
+            await safe_edit(chat_id, progress.id, "❌ Process Cancelled.")
     except Exception as exc:
         log.exception("Rename/upload failed")
-        try:
-            await client.edit_message_text(
-                chat_id, progress.id,
-                "❌ File process aagala.\n"
-                f"Reason: {str(exc)[:400]}\n"
-                "Render disk space, file size and connection check pannunga.",
-            )
-        except Exception:
-            await client.send_message(chat_id, f"❌ File process aagala: {str(exc)[:400]}")
+        reason = f"❌ Process failed.\nReason: {str(exc)[:400]}"
+        if progress:
+            await safe_edit(chat_id, progress.id, reason)
+        else:
+            await client.send_message(chat_id, reason)
     finally:
+        if transfer:
+            await transfer.stop()
+        job["running"] = False
+        if pending.get(key) is job:
+            pending.pop(key, None)
         # Remove temporary copies so large files don't fill the instance disk.
         for path in {downloaded, output}:
             if path:
