@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import shutil
+import time
+import urllib.request
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -89,6 +91,27 @@ def human_size(size):
         if value < 1024 or unit == "GB":
             return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
+
+
+def make_progress(client, chat_id, msg_id, label):
+    # Live progress on the status message (throttled to avoid FloodWait).
+    state = {"t": 0.0}
+
+    async def callback(current, total):
+        now = time.time()
+        if now - state["t"] < 5 and current != total:
+            return
+        state["t"] = now
+        pct = (current * 100 / total) if total else 0
+        try:
+            await client.edit_message_text(
+                chat_id, msg_id,
+                f"{label}\n{human_size(current)} / {human_size(total)} ({pct:.0f}%)",
+            )
+        except Exception:
+            pass
+
+    return callback
 
 
 async def delete_message(chat_id, message_id):
@@ -236,7 +259,9 @@ async def send_renamed_file(client, query):
             raise RuntimeError("Original file kidaikkala. File-a marubadi anuppunga.")
 
         downloaded = await client.download_media(
-            source, file_name=str(WORK_DIR / f"download_{source.id}")
+            source,
+            file_name=str(WORK_DIR / f"download_{source.id}"),
+            progress=make_progress(client, chat_id, progress.id, "⬇️ Download aagudhu..."),
         )
         if not downloaded or not Path(downloaded).is_file():
             raise RuntimeError("Download failed.")
@@ -253,23 +278,26 @@ async def send_renamed_file(client, query):
             "caption": Path(output).name,
         }
 
+        up_progress = make_progress(client, chat_id, progress.id, "⬆️ Upload aagudhu...")
+
         if kind == "video":
             try:
                 await client.send_video(
                     video=output,
                     thumb=thumbnail,
                     supports_streaming=True,
+                    progress=up_progress,
                     **common,
                 )
             except Exception as video_error:
                 # MKV and some containers may not be accepted as Telegram videos.
                 log.warning("Video upload failed; retrying as document: %s", video_error)
                 await client.send_document(
-                    document=output, thumb=thumbnail, **common
+                    document=output, thumb=thumbnail, progress=up_progress, **common
                 )
         else:
             await client.send_document(
-                document=output, thumb=thumbnail, **common
+                document=output, thumb=thumbnail, progress=up_progress, **common
             )
 
         await delete_message(chat_id, progress.id)
@@ -327,14 +355,32 @@ async def health_server():
         await server.serve_forever()
 
 
+async def keep_alive():
+    # Self-ping so Render free instance doesn't spin down during long transfers.
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+
+    def ping():
+        urllib.request.urlopen(url, timeout=15).read()
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(ping)
+        except Exception:
+            log.debug("Keep-alive ping failed", exc_info=True)
+
+
 async def main():
     await app.start()
     log.info("AG Sage Renamer Bot started successfully")
-    task = asyncio.create_task(health_server())
+    tasks = [asyncio.create_task(health_server()), asyncio.create_task(keep_alive())]
     try:
         await asyncio.Event().wait()
     finally:
-        task.cancel()
+        for t in tasks:
+            t.cancel()
         await app.stop()
 
 
